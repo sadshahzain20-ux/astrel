@@ -1,0 +1,29 @@
+{
+  "name": "astrel",
+  "version": "0.1.0",
+  "description": "World’s simplest zero-config testing framework",
+  "type": "module",
+  "bin": {
+    "astrel": "./dist/cli/astrel.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "keywords": [
+    "testing",
+    "test-runner",
+    "astrel"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^25.0.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {}
+}
