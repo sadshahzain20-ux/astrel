@@ -21,4 +21,5 @@ export function report(results) {
         }
     }
     console.log(`\n${results.length} tests | ${passed} passed | ${failed} failed | ${skipped} skipped`);
+    return { total: results.length, passed, failed, skipped };
 }

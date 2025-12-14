@@ -1,8 +1,11 @@
 import { pathToFileURL } from "node:url"
 import { spawn } from "node:child_process"
-import { report } from "./reporter.js"
+import * as fs from "node:fs"
+import * as path from "node:path"
 import type { TestResult } from "./result.js"
 import type { TestTarget, Lang } from "./scanner.js"
+import type { RunOptions } from "./runner.js"
+import * as ts from "typescript"
 
 function hasCmd(cmd: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -32,6 +35,14 @@ async function execCmd(name: string, cmd: string, args: string[], results: TestR
   })
 }
 
+function execCmdCode(cmd: string, args: string[]): Promise<number> {
+  return new Promise((resolve) => {
+    const p = spawn(cmd, args, { stdio: "inherit" })
+    p.on("exit", (code) => resolve(typeof code === "number" ? code : 1))
+    p.on("error", () => resolve(1))
+  })
+}
+
 async function runJs(target: TestTarget, results: TestResult[]) {
   try {
     await import(pathToFileURL(target.path).href)
@@ -41,25 +52,54 @@ async function runJs(target: TestTarget, results: TestResult[]) {
 }
 
 async function runTs(target: TestTarget, results: TestResult[]) {
-  results.push({ name: target.path, status: "skip", error: "TypeScript test requires loader", duration: 0 })
+  try {
+    const src = fs.readFileSync(target.path, "utf8")
+    const out = ts.transpileModule(src, {
+      compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },
+      fileName: target.path
+    })
+    const href = `data:text/javascript;base64,${Buffer.from(out.outputText).toString("base64")}`
+    await import(href)
+  } catch (e: any) {
+    results.push({ name: target.path, status: "fail", error: e?.message ?? String(e), duration: 0 })
+  }
 }
 
-async function runPy(target: TestTarget, results: TestResult[]) {
+async function runPyFiles(targets: TestTarget[], results: TestResult[], root: string) {
   if (!(await hasCmd("python"))) {
-    results.push({ name: target.path, status: "skip", error: "python not found", duration: 0 })
+    for (const t of targets) results.push({ name: t.path, status: "skip", error: "python not found", duration: 0 })
     return
   }
-  await execCmd(target.path, "python", [target.path], results)
+  if (await hasCmd("pytest")) {
+    const code = await execCmdCode("pytest", ["-q", root])
+    if (code === 0) {
+      results.push({ name: "pytest", status: "pass", duration: 0 })
+      return
+    }
+    if (code !== 5) {
+      results.push({ name: "pytest", status: "fail", error: `pytest exited with ${code}`, duration: 0 })
+      return
+    }
+    // code 5 means no tests collected; fall back to per-file execution
+  }
+  for (const t of targets) {
+    await execCmd(t.path, "python", [t.path], results)
+  }
 }
 
-async function runGo(targets: TestTarget[], results: TestResult[]) {
+async function runGo(targets: TestTarget[], results: TestResult[], root: string) {
   if (!(await hasCmd("go"))) {
     for (const t of targets) results.push({ name: t.path, status: "skip", error: "go not found", duration: 0 })
     return
   }
-  const dirs = Array.from(new Set(targets.map((t) => t.path.replace(/\\[^\\]+$|\/[^\/]+$/, ""))))
-  for (const dir of dirs) {
-    await execCmd(`go test ${dir}`, "go", ["test", dir], results)
+  const mod = path.join(root, "go.mod")
+  if (fs.existsSync(mod)) {
+    await execCmd("go test ./...", "go", ["test", "./..."], results)
+  } else {
+    const dirs = Array.from(new Set(targets.map((t) => t.path.replace(/\\[^\\]+$|\/[^\/]+$/, ""))))
+    for (const dir of dirs) {
+      await execCmd(`go test ${dir}`, "go", ["test", dir], results)
+    }
   }
 }
 
@@ -71,17 +111,67 @@ async function runRust(targets: TestTarget[], results: TestResult[]) {
   await execCmd("cargo test", "cargo", ["test"], results)
 }
 
-export async function execute(targets: TestTarget[], results: TestResult[]) {
+async function runJava(root: string, results: TestResult[]) {
+  const pom = path.join(root, "pom.xml")
+  const gradlew = path.join(root, process.platform === "win32" ? "gradlew.bat" : "gradlew")
+  const gradleBuild = path.join(root, "build.gradle")
+  if (fs.existsSync(pom) && (await hasCmd("mvn"))) {
+    await execCmd("mvn test", "mvn", ["-q", "-DskipTests=false", "test"], results)
+    return
+  }
+  if (fs.existsSync(gradlew)) {
+    await execCmd("gradlew test", gradlew, ["test"], results)
+    return
+  }
+  if (fs.existsSync(gradleBuild) && (await hasCmd("gradle"))) {
+    await execCmd("gradle test", "gradle", ["test"], results)
+    return
+  }
+}
+
+async function runDotnet(root: string, results: TestResult[]) {
+  const has = await hasCmd("dotnet")
+  if (!has) return
+  const sln = fs.readdirSync(root).some((f) => f.endsWith(".sln"))
+  const csproj = fs.readdirSync(root).some((f) => f.endsWith(".csproj"))
+  if (sln || csproj) {
+    await execCmd("dotnet test", "dotnet", ["test"], results)
+  }
+}
+
+function runPool<T>(items: T[], worker: (t: T) => Promise<void>, concurrency = 4, bail = false) {
+  let index = 0
+  let failed = false
+  const runners: Promise<void>[] = []
+  const runNext = async () => {
+    if (failed && bail) return
+    const i = index++
+    const item = items[i]
+    if (item === undefined) return
+    try {
+      await worker(item)
+    } catch {
+      failed = true
+    }
+    await runNext()
+  }
+  for (let i = 0; i < Math.min(concurrency, items.length); i++) runners.push(runNext())
+  return Promise.all(runners)
+}
+
+export async function execute(targets: TestTarget[], results: TestResult[], root: string, options?: RunOptions) {
   const byLang: Record<Lang, TestTarget[]> = {
     js: [], ts: [], py: [], go: [], rs: [], c: [], cpp: [], java: [], cs: []
   }
   for (const t of targets) byLang[t.lang].push(t)
 
-  for (const t of byLang.js) await runJs(t, results)
-  for (const t of byLang.ts) await runTs(t, results)
-  for (const t of byLang.py) await runPy(t, results)
-  if (byLang.go.length) await runGo(byLang.go, results)
+  await runPool(byLang.js, (t) => runJs(t, results), options?.concurrency ?? 4, options?.bail ?? false)
+  await runPool(byLang.ts, (t) => runTs(t, results), options?.concurrency ?? 4, options?.bail ?? false)
+  if (byLang.py.length) await runPyFiles(byLang.py, results, root)
+  if (byLang.go.length) await runGo(byLang.go, results, root)
   if (byLang.rs.length) await runRust(byLang.rs, results)
+  await runJava(root, results)
+  await runDotnet(root, results)
   for (const t of [...byLang.c, ...byLang.cpp]) results.push({ name: t.path, status: "skip", error: "C/C++ not supported yet", duration: 0 })
   for (const t of byLang.java) results.push({ name: t.path, status: "skip", error: "Java requires test framework", duration: 0 })
   for (const t of byLang.cs) results.push({ name: t.path, status: "skip", error: "dotnet test required", duration: 0 })
