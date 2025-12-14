@@ -24,7 +24,7 @@ Astrel adapts to **you**.
 - 🌍 Multi-language support
 - ⚡ Instant execution
 - 🔌 Drop-in integration for existing projects
-- 🧪 Opinion-light, productivity-heavy
+- 🧪 Opinion-light, productivity-heav
 
 ---
 astrel/
