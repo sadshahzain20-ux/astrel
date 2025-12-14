@@ -1,4 +1,4 @@
-export type TestStatus = "pass" | "fail"
+export type TestStatus = "pass" | "fail" | "skip"
 
 export interface TestResult {
   name: string
