@@ -5,7 +5,7 @@
 > **Testing should be effortless.**
 
 No boilerplate. No painful setup. No framework lock-in.  
-Just write tests and run them — in **any language**.
+Just write tests and run them in **any language**.
 
 ---
 
